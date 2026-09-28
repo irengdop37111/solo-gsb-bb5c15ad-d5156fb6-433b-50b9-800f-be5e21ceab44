@@ -29,15 +29,11 @@ var import_promises = __toESM(require("node:fs/promises"), 1);
 var import_node_path = __toESM(require("node:path"), 1);
 var import_node_url = require("node:url");
 var import_meta = {};
-var here;
-try {
-  here = typeof __dirname !== "undefined" ? __dirname : import_node_path.default.dirname((0, import_node_url.fileURLToPath)(import_meta.url));
-} catch {
-  here = import_node_path.default.dirname(new URL(import_meta.url).pathname);
-}
+var here = import_node_path.default.dirname((0, import_node_url.fileURLToPath)(import_meta.url));
 var PORT = Number(process.env.PORT ?? 3e3);
 var DATA_DIR = process.env.DATA_DIR ? import_node_path.default.resolve(process.env.DATA_DIR) : import_node_path.default.join(process.env.HOME ?? process.cwd(), ".clause-reference-validator");
 var DATA_FILE = import_node_path.default.join(DATA_DIR, "state.json");
+var TMP_PREFIX = `${DATA_FILE}.tmp.`;
 var app = (0, import_express.default)();
 app.use(import_express.default.json({ limit: "10mb" }));
 function isPersistedState(v) {
@@ -54,11 +50,57 @@ async function readState() {
     return null;
   }
 }
-async function writeState(state) {
+var tmpSeq = 0;
+async function writeStateAtomic(state) {
   await import_promises.default.mkdir(DATA_DIR, { recursive: true });
-  const tmp = `${DATA_FILE}.tmp`;
-  await import_promises.default.writeFile(tmp, JSON.stringify(state), "utf8");
-  await import_promises.default.rename(tmp, DATA_FILE);
+  const tmp = `${TMP_PREFIX}${process.pid}.${tmpSeq++}`;
+  let handle = null;
+  try {
+    handle = await import_promises.default.open(tmp, "w");
+    await handle.writeFile(JSON.stringify(state), "utf8");
+    await handle.sync();
+  } catch (err) {
+    await import_promises.default.rm(tmp, { force: true }).catch(() => void 0);
+    throw err;
+  } finally {
+    if (handle) await handle.close();
+  }
+  try {
+    await import_promises.default.rename(tmp, DATA_FILE);
+  } catch (err) {
+    await import_promises.default.rm(tmp, { force: true }).catch(() => void 0);
+    throw err;
+  }
+  try {
+    const dir = await import_promises.default.open(DATA_DIR, "r");
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  } catch {
+  }
+}
+var writeChain = Promise.resolve();
+function enqueueWrite(state) {
+  const task = writeChain.then(() => writeStateAtomic(state));
+  writeChain = task.then(
+    () => void 0,
+    () => void 0
+  );
+  return task;
+}
+async function cleanStaleTmp() {
+  try {
+    const base = import_node_path.default.basename(DATA_FILE);
+    const entries = await import_promises.default.readdir(DATA_DIR).catch(() => []);
+    for (const name of entries) {
+      if (name.startsWith(import_node_path.default.basename(TMP_PREFIX)) || name === `${base}.tmp`) {
+        await import_promises.default.rm(import_node_path.default.join(DATA_DIR, name), { force: true });
+      }
+    }
+  } catch {
+  }
 }
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "clause-reference-validator" });
@@ -74,7 +116,7 @@ app.put("/api/state", async (req, res) => {
     return;
   }
   try {
-    await writeState(body);
+    await enqueueWrite(body);
     res.json({ ok: true, savedAt: Date.now() });
   } catch (err) {
     res.status(500).json({ error: `\u4FDD\u5B58\u5931\u8D25\uFF1A${err.message}` });
@@ -99,7 +141,9 @@ if (import_node_fs.default.existsSync(distDir)) {
     }
   });
 }
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\u6761\u6B3E\u5F15\u7528\u6821\u9A8C\u53F0\u5DF2\u542F\u52A8\uFF1A http://localhost:${PORT}`);
-  console.log(`\u672C\u5730\u6570\u636E\u6587\u4EF6\uFF1A${DATA_FILE}`);
+void cleanStaleTmp().finally(() => {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`\u6761\u6B3E\u5F15\u7528\u6821\u9A8C\u53F0\u5DF2\u542F\u52A8\uFF1A http://localhost:${PORT}`);
+    console.log(`\u672C\u5730\u6570\u636E\u6587\u4EF6\uFF1A${DATA_FILE}`);
+  });
 });

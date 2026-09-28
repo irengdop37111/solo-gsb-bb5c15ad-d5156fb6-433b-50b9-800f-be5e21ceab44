@@ -8,6 +8,7 @@ var here = path.dirname(fileURLToPath(import.meta.url));
 var PORT = Number(process.env.PORT ?? 3e3);
 var DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.env.HOME ?? process.cwd(), ".clause-reference-validator");
 var DATA_FILE = path.join(DATA_DIR, "state.json");
+var TMP_PREFIX = `${DATA_FILE}.tmp.`;
 var app = express();
 app.use(express.json({ limit: "10mb" }));
 function isPersistedState(v) {
@@ -24,11 +25,57 @@ async function readState() {
     return null;
   }
 }
-async function writeState(state) {
+var tmpSeq = 0;
+async function writeStateAtomic(state) {
   await fsp.mkdir(DATA_DIR, { recursive: true });
-  const tmp = `${DATA_FILE}.tmp`;
-  await fsp.writeFile(tmp, JSON.stringify(state), "utf8");
-  await fsp.rename(tmp, DATA_FILE);
+  const tmp = `${TMP_PREFIX}${process.pid}.${tmpSeq++}`;
+  let handle = null;
+  try {
+    handle = await fsp.open(tmp, "w");
+    await handle.writeFile(JSON.stringify(state), "utf8");
+    await handle.sync();
+  } catch (err) {
+    await fsp.rm(tmp, { force: true }).catch(() => void 0);
+    throw err;
+  } finally {
+    if (handle) await handle.close();
+  }
+  try {
+    await fsp.rename(tmp, DATA_FILE);
+  } catch (err) {
+    await fsp.rm(tmp, { force: true }).catch(() => void 0);
+    throw err;
+  }
+  try {
+    const dir = await fsp.open(DATA_DIR, "r");
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  } catch {
+  }
+}
+var writeChain = Promise.resolve();
+function enqueueWrite(state) {
+  const task = writeChain.then(() => writeStateAtomic(state));
+  writeChain = task.then(
+    () => void 0,
+    () => void 0
+  );
+  return task;
+}
+async function cleanStaleTmp() {
+  try {
+    const base = path.basename(DATA_FILE);
+    const entries = await fsp.readdir(DATA_DIR).catch(() => []);
+    for (const name of entries) {
+      if (name.startsWith(path.basename(TMP_PREFIX)) || name === `${base}.tmp`) {
+        await fsp.rm(path.join(DATA_DIR, name), { force: true });
+      }
+    }
+  } catch {
+  }
 }
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "clause-reference-validator" });
@@ -44,7 +91,7 @@ app.put("/api/state", async (req, res) => {
     return;
   }
   try {
-    await writeState(body);
+    await enqueueWrite(body);
     res.json({ ok: true, savedAt: Date.now() });
   } catch (err) {
     res.status(500).json({ error: `\u4FDD\u5B58\u5931\u8D25\uFF1A${err.message}` });
@@ -69,7 +116,9 @@ if (fs.existsSync(distDir)) {
     }
   });
 }
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\u6761\u6B3E\u5F15\u7528\u6821\u9A8C\u53F0\u5DF2\u542F\u52A8\uFF1A http://localhost:${PORT}`);
-  console.log(`\u672C\u5730\u6570\u636E\u6587\u4EF6\uFF1A${DATA_FILE}`);
+void cleanStaleTmp().finally(() => {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`\u6761\u6B3E\u5F15\u7528\u6821\u9A8C\u53F0\u5DF2\u542F\u52A8\uFF1A http://localhost:${PORT}`);
+    console.log(`\u672C\u5730\u6570\u636E\u6587\u4EF6\uFF1A${DATA_FILE}`);
+  });
 });

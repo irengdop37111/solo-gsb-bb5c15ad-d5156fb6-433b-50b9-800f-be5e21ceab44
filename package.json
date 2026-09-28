@@ -13,7 +13,8 @@
     "build": "npm run build:client && npm run build:server",
     "start": "node dist-server/index.mjs",
     "preview": "npm run build && npm start",
-    "check": "tsx scripts/check.ts"
+    "check": "tsx scripts/check.ts",
+    "check:save": "tsx scripts/storage-queue-check.ts && npm run build:server && node scripts/concurrency-check.mjs"
   },
   "dependencies": {
     "express": "^4.19.2",

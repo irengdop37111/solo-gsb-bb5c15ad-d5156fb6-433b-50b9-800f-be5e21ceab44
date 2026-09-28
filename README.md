@@ -322,6 +322,81 @@ npm run dev
 - 首次打开若浏览器无数据，会尝试读取后端文件（便于换浏览器共享），否则载入内置示例。
 - 后端仅监听本地 HTTP，提供 `/api/state`（GET/PUT）、`/api/health`，不连接任何外部服务。
 
+### 连续编辑的保存一致性（并发保存不回退）
+
+连续修改条款及随文档保存的记录（批注、规范用语规则、快照、问题基线、审签、例外处置）时：
+
+- **本地保存始终即时生效**：每次提交立即写入浏览器 `localStorage`，界面不受网络影响；
+- **浏览器端串行同步、合并在飞修改**：同一时刻只有一个 `PUT /api/state` 在飞；请求发送期间又产生的修改不会另发请求，而是合并为「最新待写状态」，上一请求结束后只补发最新的完整状态。保存严格按提交顺序进行，因此服务器文件最终必然是**最后一次成功提交的完整状态**，中间状态不可能覆盖更新的状态；
+- **服务端写入串行化且原子替换**：并发到达的 PUT 在服务端按顺序排队逐个落盘；每次写入使用独立临时文件（`state.json.tmp.<pid>.<序号>`，不再共用同一个 `.tmp`），完整写入并 `fsync` 后以 `rename` 原子替换 `state.json`——读取方只会看到替换前或替换后的完整文件；
+- **写入失败不损坏旧文件**：临时文件写入 / 替换失败时原文件保持完整，该请求返回 500 且不影响队列中的后续保存；浏览器端对失败做有限退避重试（共 3 次），持续失败则放弃本轮（本地仍有完整数据），下一次修改触发的保存照常进行；
+- 进程崩溃遗留的临时文件在服务启动时自动清理（含旧版本共用的 `state.json.tmp`）。
+
+## HTTP API
+
+服务默认监听 `http://localhost:3000`（Docker 与 `npm start` 相同；开发模式前端在 5173，`/api` 代理到 3000）。除 `/api/validate` 外，生产模式下其余路径返回前端 SPA 页面。
+
+### GET /api/health
+
+健康检查，Docker 健康检查使用同一端点：
+
+```bash
+curl http://localhost:3000/api/health
+# {"ok":true,"service":"clause-reference-validator"}
+```
+
+### GET /api/state
+
+读取服务器上保存的完整状态；尚无文件时 `state` 为 `null`：
+
+```bash
+curl http://localhost:3000/api/state
+# {"state":{"doc":{"id":"...","title":"...","root":[...]},"confirmed":{}, ...}}
+```
+
+### PUT /api/state
+
+以**完整状态**替换服务器文件（整体覆盖，不做字段合并）。请求体即下文 JSON 导出文件中去掉 `app` / `version` / `exportedAt` 包装后的状态对象，至少需要：
+
+```json
+{ "doc": { "id": "doc-1", "title": "文档标题", "root": [], "updatedAt": 0 }, "confirmed": {} }
+```
+
+调用示例（`@state.json` 为先前 GET 取回并修改后的文件）：
+
+```bash
+curl -X PUT http://localhost:3000/api/state \
+  -H 'Content-Type: application/json' \
+  --data-binary @state.json
+# 成功：{"ok":true,"savedAt":1780000000000}
+# 数据格式不合法：HTTP 400 {"error":"数据格式不合法：需要 { doc: { title, root }, confirmed }"}
+# 写入失败（磁盘只读等，原文件保留）：HTTP 500 {"error":"保存失败：..."}
+```
+
+可用下面的最小脚本批量备份 / 恢复：
+
+```bash
+# 备份
+curl -s http://localhost:3000/api/state | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>require('fs').writeFileSync('state.json',JSON.stringify(JSON.parse(s).state)))"
+# 恢复
+curl -s -X PUT http://localhost:3000/api/state -H 'Content-Type: application/json' --data-binary @state.json
+```
+
+并发 PUT（如多个标签页同时编辑）在服务端按到达顺序串行、原子落盘；客户端自身还会合并在飞期间的修改，因此最终文件等于最后一次成功提交的完整状态。
+
+### POST /api/validate
+
+对「导出 JSON」格式的 `ExportBundle`（含 `document.root`）做基本结构校验，不写入任何数据：
+
+```bash
+curl -X POST http://localhost:3000/api/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"app":"clause-reference-validator","version":1,"document":{"title":"t","root":[]},"confirmed":{},"exportedAt":"2026-09-28T00:00:00.000Z"}'
+# {"ok":true,"title":"t","rootCount":0}
+```
+
+前端「导出 JSON / 导入 JSON」不经过该接口：导出为浏览器本地下载，导入直接在浏览器内解析恢复（结构见第 8 节）。
+
 ## 项目结构
 
 ```
@@ -360,9 +435,12 @@ npm run dev
 │       ├── tree.ts         # 树查找/增删/重排
 │       ├── store.ts        # 状态、撤销重做、结构操作、批注、规范规则、快照、问题基线、修订沙盒、引用阅读包、审签、问题例外、持久化
 │       ├── highlighter.ts  # 正文 ↔ 关系图 ↔ 版本对比/批注/规范命中/沙盒预演/阅读包/路径核对跳转的联动高亮
-│       ├── storage.ts      # localStorage + 服务端文件存储
+│       ├── storage.ts      # localStorage + 服务端文件存储；保存队列（在飞修改合并为最新待写状态、按序串行、失败退避重试）
 │       └── sample.ts       # 内置示例（含各类问题与示例规范规则）
-└── scripts/check.ts        # 解析/分析/改写/批注/规范用语/版本对比/问题基线/影响分析/路径核对/修订沙盒/引用阅读包核心逻辑的端到端校验
+└── scripts/
+    ├── check.ts                   # 解析/分析/改写/批注/规范用语/版本对比/问题基线/影响分析/路径核对/修订沙盒/引用阅读包核心逻辑的端到端校验
+    ├── storage-queue-check.ts     # 浏览器保存队列语义校验（合并/串行/最终最新/失败恢复）
+    └── concurrency-check.mjs      # 真实拉起服务：并发 PUT 确定顺序、最终为最新、失败保留旧文件、启动清理临时文件
 ```
 
 ## 自检
@@ -374,3 +452,11 @@ npm run check
 ```
 
 预期输出「通过 466 项，失败 0 项」。
+
+保存一致性（浏览器端队列 + 服务端并发写入）的端到端校验：
+
+```bash
+npm run check:save
+```
+
+该命令先以 mock fetch 校验浏览器端保存队列（同一时刻仅一个请求在飞、在飞修改合并为最新待写状态、按提交顺序串行、最终落盘为最后一次提交、失败退避重试、持续失败后后续保存仍可继续），再构建服务端并真实拉起 `dist-server/index.mjs`，验证 20 个并发 PUT 全部成功且最终文件为最后提交的完整状态、非法请求 400 不破坏文件、写入失败返回 500 且原文件完整保留、恢复可写后后续保存成功、启动时清理遗留临时文件。
