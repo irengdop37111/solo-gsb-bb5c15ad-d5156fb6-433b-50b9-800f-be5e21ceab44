@@ -24,6 +24,7 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 
 // server/index.ts
 var import_express = __toESM(require("express"), 1);
+var import_node_crypto = __toESM(require("node:crypto"), 1);
 var import_node_fs = __toESM(require("node:fs"), 1);
 var import_promises = __toESM(require("node:fs/promises"), 1);
 var import_node_path = __toESM(require("node:path"), 1);
@@ -54,11 +55,32 @@ async function readState() {
     return null;
   }
 }
-async function writeState(state) {
+async function atomicWriteState(state) {
   await import_promises.default.mkdir(DATA_DIR, { recursive: true });
-  const tmp = `${DATA_FILE}.tmp`;
-  await import_promises.default.writeFile(tmp, JSON.stringify(state), "utf8");
-  await import_promises.default.rename(tmp, DATA_FILE);
+  const payload = JSON.stringify(state);
+  const tmp = import_node_path.default.join(DATA_DIR, `.state.${process.pid}.${import_node_crypto.default.randomUUID()}.tmp`);
+  let fh = null;
+  try {
+    fh = await import_promises.default.open(tmp, "wx");
+    await fh.writeFile(payload, "utf8");
+    await fh.sync();
+    await fh.close();
+    fh = null;
+    await import_promises.default.rename(tmp, DATA_FILE);
+  } catch (err) {
+    if (fh) await fh.close().catch(() => void 0);
+    await import_promises.default.rm(tmp, { force: true }).catch(() => void 0);
+    throw err;
+  }
+}
+var writeChain = Promise.resolve();
+function enqueueWrite(state) {
+  const next = writeChain.then(() => atomicWriteState(state));
+  writeChain = next.then(
+    () => void 0,
+    () => void 0
+  );
+  return next;
 }
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "clause-reference-validator" });
@@ -74,7 +96,7 @@ app.put("/api/state", async (req, res) => {
     return;
   }
   try {
-    await writeState(body);
+    await enqueueWrite(body);
     res.json({ ok: true, savedAt: Date.now() });
   } catch (err) {
     res.status(500).json({ error: `\u4FDD\u5B58\u5931\u8D25\uFF1A${err.message}` });
@@ -99,7 +121,23 @@ if (import_node_fs.default.existsSync(distDir)) {
     }
   });
 }
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\u6761\u6B3E\u5F15\u7528\u6821\u9A8C\u53F0\u5DF2\u542F\u52A8\uFF1A http://localhost:${PORT}`);
-  console.log(`\u672C\u5730\u6570\u636E\u6587\u4EF6\uFF1A${DATA_FILE}`);
-});
+async function cleanupStaleTmpFiles() {
+  try {
+    const entries = await import_node_fs.default.promises.readdir(DATA_DIR);
+    await Promise.all(
+      entries.filter(
+        (name) => name.startsWith(".state.") && name.endsWith(".tmp") || name === "state.json.tmp"
+      ).map(
+        (name) => import_node_fs.default.promises.rm(import_node_path.default.join(DATA_DIR, name), { force: true }).catch(() => void 0)
+      )
+    );
+  } catch {
+  }
+}
+void (async () => {
+  await cleanupStaleTmpFiles();
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`\u6761\u6B3E\u5F15\u7528\u6821\u9A8C\u53F0\u5DF2\u542F\u52A8\uFF1A http://localhost:${PORT}`);
+    console.log(`\u672C\u5730\u6570\u636E\u6587\u4EF6\uFF1A${DATA_FILE}`);
+  });
+})();

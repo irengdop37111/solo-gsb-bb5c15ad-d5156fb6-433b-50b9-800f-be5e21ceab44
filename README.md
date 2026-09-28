@@ -315,12 +315,79 @@ npm run dev
 
 ## 数据保存在哪里
 
-- 浏览器 `localStorage`（键 `clause-reference-validator:v1`）：编辑时即时保存；
-- 后端本地文件：每次变更后约 0.6 秒防抖写入
+- 浏览器 `localStorage`（键 `clause-reference-validator:v1`）：编辑时即时保存（每次提交同步写入，连续编辑不受网络状况影响）；
+- 后端本地文件：每次变更后约 0.6 秒防抖触发一次服务端镜像保存
   - Docker：`/data/state.json`（持久卷）
   - 本机：`~/.clause-reference-validator/state.json`，可用环境变量 `DATA_DIR` 更改；
 - 首次打开若浏览器无数据，会尝试读取后端文件（便于换浏览器共享），否则载入内置示例。
 - 后端仅监听本地 HTTP，提供 `/api/state`（GET/PUT）、`/api/health`，不连接任何外部服务。
+
+### 连续编辑的保存顺序与原子性
+
+连续修改条款及随文档保存的记录（确认、批注、规范规则、快照、问题基线、审签、例外处置）时：
+
+- **本地即时生效**：每次提交都同步写入 `localStorage`，不等待任何网络请求；
+- **服务端镜像严格串行**：浏览器任一时刻最多只有一个 `PUT /api/state` 在途；发送期间产生的修改会被**合并为最新待写状态**，上一请求结束后只发送这份最新完整状态，并始终按提交顺序同步，因此旧状态不可能越过新状态覆盖服务器文件；
+- **服务端原子落盘**：并发保存按请求到达顺序串行执行；每次写入先写一个内容专属的唯一临时文件（`fsync` 后 `rename` 替换 `state.json`），任何时刻读取到的都是**完整的旧文件或完整的新文件**，不会读到半写内容；
+- **失败安全**：写入失败发生在替换之前，原有完整文件保留不变，失败请求返回 500；浏览器对网络错误 / 5xx 自动退避重试（重试期间的新编辑会顶替为最新待写状态），重试有上限，放弃后下次编辑仍会继续尝试，不会因一次失败永久停摆；
+- 最终服务器文件等于**最后一次成功提交的完整状态**。
+
+## HTTP API
+
+服务端是本地 Express（Docker / `npm start` 均在 `http://localhost:3000`；开发模式前端 5173 通过 Vite 代理转发 `/api`）。所有请求体均为 JSON。
+
+### `GET /api/health`
+
+健康检查，容器 HEALTHCHECK 使用。
+
+```bash
+curl http://localhost:3000/api/health
+# 200 {"ok":true,"service":"clause-reference-validator"}
+```
+
+### `GET /api/state`
+
+读取服务器侧完整状态；尚无文件时 `state` 为 `null`。
+
+```bash
+curl http://localhost:3000/api/state
+# 200 { "state": { "doc": { "id", "title", "root", "updatedAt" }, "confirmed", ... } }
+# 200 { "state": null }
+```
+
+### `PUT /api/state`
+
+以请求体**整体替换**服务器状态文件（与页面自动保存同一接口；字段结构同「导出 JSON」中的持久化字段，至少需包含 `doc.title` 与 `doc.root` 数组）。并发请求按到达顺序串行、原子落盘。
+
+```bash
+curl -X PUT http://localhost:3000/api/state \
+  -H 'Content-Type: application/json' \
+  -d '{"doc":{"id":"d1","title":"测试文档","root":[],"updatedAt":1790000000000},"confirmed":{}}'
+# 200 { "ok": true, "savedAt": 1790000000000 }
+# 400 { "error": "数据格式不合法：需要 { doc: { title, root }, confirmed }" }
+# 500 { "error": "保存失败：…" }  // 原文件保持不变，可重试
+```
+
+用本地 JSON 导出文件整体写回（例如从备份恢复）：
+
+```bash
+curl -X PUT http://localhost:3000/api/state \
+  -H 'Content-Type: application/json' \
+  --data-binary @backup.json
+```
+
+> 说明：`PUT` 是整体替换而非字段合并；浏览器自动保存总是携带完整状态，外部调用也应发送完整状态。JSON 导入导出行为（页面内「粘贴 / 导入」「导出 JSON」，导出包为 `{ app, version, document, ... }` 形态）不受影响。
+
+### `POST /api/validate`
+
+校验导入包结构（不写文件）：请求体需包含 `document.root` 数组。
+
+```bash
+curl -X POST http://localhost:3000/api/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"document":{"title":"t","root":[]}}'
+# 200 { "ok": true, "title": "t", "rootCount": 0 }
+```
 
 ## 项目结构
 
@@ -335,7 +402,7 @@ npm run dev
 ├── shared/
 │   └── model.ts            # 前后端共享的数据模型
 ├── server/
-│   └── index.ts            # Express：本地 JSON 存储 API + 静态托管 SPA
+│   └── index.ts            # Express：本地 JSON 存储 API（并发保存 FIFO 串行 + 唯一临时文件原子替换）+ 静态托管 SPA
 ├── src/
 │   ├── main.tsx / App.tsx
 │   ├── components/         # 工具栏、文档树、引用 chip、问题面板、审阅批注、规范用语审校、关系视图、引用路径核对、版本对比、修订沙盒、引用阅读包、条款审签、导入弹窗
@@ -360,9 +427,13 @@ npm run dev
 │       ├── tree.ts         # 树查找/增删/重排
 │       ├── store.ts        # 状态、撤销重做、结构操作、批注、规范规则、快照、问题基线、修订沙盒、引用阅读包、审签、问题例外、持久化
 │       ├── highlighter.ts  # 正文 ↔ 关系图 ↔ 版本对比/批注/规范命中/沙盒预演/阅读包/路径核对跳转的联动高亮
-│       ├── storage.ts      # localStorage + 服务端文件存储
+│       ├── storage.ts      # localStorage 即时保存 + 服务端镜像串行保存队列（在途修改合并、按序提交、失败退避重试）
 │       └── sample.ts       # 内置示例（含各类问题与示例规范规则）
-└── scripts/check.ts        # 解析/分析/改写/批注/规范用语/版本对比/问题基线/影响分析/路径核对/修订沙盒/引用阅读包核心逻辑的端到端校验
+├── scripts/
+│   ├── check.ts             # 核心逻辑端到端校验（npm run check）
+│   ├── storage-check.mts    # 浏览器端串行保存队列自检（npm run check:storage）
+│   └── server-check.mts     # 服务端并发保存顺序 / 原子替换 / 失败恢复自检（npm run check:server）
+└── ...
 ```
 
 ## 自检
@@ -374,3 +445,17 @@ npm run check
 ```
 
 预期输出「通过 466 项，失败 0 项」。
+
+另有两个不依赖浏览器环境的专项自检：
+
+```bash
+npm run check:storage   # 浏览器端保存队列：串行、在途修改合并、提交顺序、失败退避重试与恢复（mock fetch）
+npm run check:server    # 服务端并发 PUT：按序串行原子落盘、失败保留原文件、临时文件清理（真实 HTTP 进程）
+```
+
+## 本轮变动：连续编辑时服务器镜像不再回退
+
+- **问题**：旧实现中自动保存不等待上一请求，且服务端并发写入共用同一个 `state.json.tmp` 临时文件；两次保存交叠时，旧状态可能在新状态之后落盘造成回退，或因互相截断导致一次写入失败。
+- **浏览器端**（`src/lib/storage.ts`）：新增单连接保存队列——同一时刻最多一个 PUT 在途；发送期间产生的修改合并为最新待写状态，请求结束后只发送该完整状态，严格按提交顺序同步；网络错误 / 5xx 自动退避重试（0.4s / 1.2s / 3s，最多 4 次尝试），退避期间的新编辑提前顶替旧状态；本地 `localStorage` 仍每次提交即时写入。`serverStore.save` 的调用约定（`Promise<boolean>`）与 `/api/state` 数据格式不变。
+- **服务端**（`server/index.ts`）：写入经 FIFO 队列串行化，保证并发保存的确定顺序；每次写入使用 `.state.<pid>.<uuid>.tmp` 唯一临时文件，`'wx'` 独占创建、写入并 `fsync` 后 `rename` 原子替换 `state.json`；写入失败只清理自己的临时文件、原文件完整保留；进程启动时清理上次崩溃残留的临时文件。GET/PUT 的路径、请求体与响应约定保持不变。
+- **交付物**：上述 HTTP API（含调用示例）、`npm run check:storage` / `npm run check:server` 两个自检脚本；Docker 构建与启动方式不变（`docker compose up --build`，卷内 `/data/state.json`）。
